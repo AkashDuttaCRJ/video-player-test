@@ -46,7 +46,8 @@ export function getTranscodeSettings(mode: TranscodeMode): TranscodeSettings {
 }
 
 // HDR to SDR tone mapping filter for lower renditions
-const TONEMAP_FILTER =
+// Software-based zscale tonemap (slow but compatible)
+const TONEMAP_FILTER_SOFTWARE =
   'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p';
 
 function buildScaleFilter(
@@ -57,9 +58,12 @@ function buildScaleFilter(
   const { width, height } = rendition;
 
   if (needsTonemap) {
-    // Software tonemap then scale - always use software scale after tonemap
-    // because the tonemap filter chain outputs to system memory
-    return `${TONEMAP_FILTER},scale=${width}:${height}`;
+    // NVIDIA: Use CUDA upload + OpenCL tonemap + CUDA scale (all GPU)
+    if (hwAccel.method === 'nvidia') {
+      return `format=p010,hwupload_cuda,tonemap_opencl=tonemap=hable:desat=0:format=nv12,hwdownload,format=nv12,hwupload_cuda,scale_cuda=w=${width}:h=${height}`;
+    }
+    // Other HW: Software tonemap then scale (slow fallback)
+    return `${TONEMAP_FILTER_SOFTWARE},scale=${width}:${height}`;
   }
 
   if (hwAccel.method === 'nvidia') {
@@ -131,36 +135,13 @@ function buildVP9Args(
 function buildHEVCArgs(
   rendition: Rendition,
   settings: TranscodeSettings,
-  hwAccel: HWAccelInfo,
-  needsTonemap: boolean
+  hwAccel: HWAccelInfo
 ): string[] {
   const bitrate = rendition.hevcBitrate;
   const maxrate = Math.floor(bitrate * 1.5);
   const bufsize = bitrate * 2;
 
-  // When tonemapping is needed, use software encoder because the tonemap
-  // filter chain outputs to system memory and hwupload is unreliable
-  if (needsTonemap) {
-    return [
-      '-c:v',
-      'libx265',
-      '-b:v',
-      `${bitrate}k`,
-      '-maxrate',
-      `${maxrate}k`,
-      '-bufsize',
-      `${bufsize}k`,
-      '-g',
-      '120',
-      '-keyint_min',
-      '120',
-      '-preset',
-      settings.x265Preset,
-      '-x265-params',
-      'log-level=error',
-    ];
-  }
-
+  // NVIDIA can do GPU tonemapping + GPU encoding (fast)
   if (hwAccel.method === 'nvidia') {
     return [
       '-c:v',
@@ -364,10 +345,15 @@ export async function transcodeRendition(
   const runPass = async (pass: 1 | 2, isLastPass: boolean): Promise<void> => {
     const args: string[] = ['-y'];
 
-    // Input args (HW accel) - only use HW accel when not tonemapping
-    // because tonemap filter chain is software-based
-    if (codec === 'hevc' && !needsTonemap) {
-      args.push(...buildHWAccelInputArgs(hwAccel));
+    // Input args (HW accel)
+    // NVIDIA: Always use HW accel (tonemapping uses CUDA/OpenCL pipeline)
+    // Other HW: Only use when not tonemapping (software tonemap is incompatible)
+    if (codec === 'hevc') {
+      if (hwAccel.method === 'nvidia') {
+        args.push(...buildHWAccelInputArgs(hwAccel));
+      } else if (!needsTonemap) {
+        args.push(...buildHWAccelInputArgs(hwAccel));
+      }
     }
 
     args.push('-i', inputPath);
@@ -379,7 +365,7 @@ export async function transcodeRendition(
     if (codec === 'vp9') {
       args.push(...buildVP9Args(rendition, settings, pass, passLogFile));
     } else {
-      args.push(...buildHEVCArgs(rendition, settings, hwAccel, needsTonemap));
+      args.push(...buildHEVCArgs(rendition, settings, hwAccel));
     }
 
     if (isLastPass) {
