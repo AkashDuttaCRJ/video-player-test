@@ -149,6 +149,15 @@ export interface HWAccelInfo {
   hwaccelFlag?: string;
   hwaccelOutputFormat?: string;
   scaleFilter: string;
+  supportsVP9HW?: boolean; // True if VP9 uses hardware encoder (not libvpx-vp9)
+  supportsHEVC10bit?: boolean; // True if HEVC 10-bit encoding supported
+  supportsVP910bit?: boolean; // True if VP9 10-bit encoding supported
+}
+
+// Hybrid encoding: use different HW for different codecs
+export interface HybridHWAccel {
+  hevc: HWAccelInfo; // HW to use for HEVC encoding
+  vp9: HWAccelInfo; // HW to use for VP9 encoding
 }
 
 // Renditions
@@ -242,6 +251,7 @@ export interface AppState {
   selectedRenditions: RenditionQuality[];
   availableHWAccel: HWAccelInfo[];
   selectedHWAccel: HWAccelInfo | null;
+  hybridHWAccel: HybridHWAccel | null; // For hybrid mode (different HW per codec)
   transcodeProgress: Map<string, TranscodeProgress>;
   packagerOutput: PackagerOutput | null;
   error: string | null;

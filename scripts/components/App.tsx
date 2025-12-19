@@ -6,6 +6,7 @@ import type {
   ToolStatus,
   MediaInfo as MediaInfoType,
   HWAccelInfo,
+  HybridHWAccel,
   Rendition,
   RenditionQuality,
   TranscodeProgress,
@@ -17,7 +18,7 @@ import {
   getManualInstallInstructions,
 } from '../lib/tool-checker.js';
 import { probeMedia, ProbeError } from '../lib/probe.js';
-import { detectHWAcceleration } from '../lib/hw-detect.js';
+import { detectHWAcceleration, buildHybridConfig, createHybridDisplayInfo } from '../lib/hw-detect.js';
 import {
   buildRenditionLadder,
   filterRenditions,
@@ -86,6 +87,7 @@ export function App({ devMode }: AppProps) {
   const [selectedHWAccel, setSelectedHWAccel] = useState<HWAccelInfo | null>(
     null
   );
+  const [hybridConfig, setHybridConfig] = useState<HybridHWAccel | null>(null);
 
   const [currentJob, setCurrentJob] = useState<{
     codec: 'vp9' | 'hevc';
@@ -198,17 +200,30 @@ export function App({ devMode }: AppProps) {
 
     // Detect hardware acceleration
     const hwOptions = await detectHWAcceleration();
-    setAvailableHWAccel(hwOptions);
+
+    // Check if hybrid mode is available (e.g., NVIDIA for HEVC + Intel for VP9)
+    const hybrid = buildHybridConfig(hwOptions);
+    setHybridConfig(hybrid);
+
+    // Build display options - add hybrid at the top if available
+    let displayOptions = [...hwOptions];
+    if (hybrid) {
+      const hybridDisplay = createHybridDisplayInfo(hybrid);
+      // Add hybrid option at the beginning (recommended)
+      displayOptions = [hybridDisplay, ...hwOptions];
+    }
+    setAvailableHWAccel(displayOptions);
 
     if (devMode) {
       setStep('selecting-renditions');
-    } else if (hwOptions.length > 1) {
+    } else if (displayOptions.length > 1) {
       setStep('selecting-hw');
     } else {
-      setSelectedHWAccel(hwOptions[0]);
+      setSelectedHWAccel(displayOptions[0]);
       startTranscoding(
         renditions.map((r) => r.quality),
-        hwOptions[0]
+        displayOptions[0],
+        hybrid && displayOptions[0].displayName.startsWith('Hybrid') ? hybrid : null
       );
     }
   }, [mediaInfo, devMode]);
@@ -220,25 +235,34 @@ export function App({ devMode }: AppProps) {
       if (availableHWAccel.length > 1) {
         setStep('selecting-hw');
       } else {
-        setSelectedHWAccel(availableHWAccel[0]);
-        startTranscoding(selected, availableHWAccel[0]);
+        const hw = availableHWAccel[0];
+        setSelectedHWAccel(hw);
+        // Check if it's the hybrid option
+        const isHybrid = hw.displayName.startsWith('Hybrid');
+        startTranscoding(selected, hw, isHybrid ? hybridConfig : null);
       }
     },
-    [availableHWAccel]
+    [availableHWAccel, hybridConfig]
   );
 
   // Handle HW selection
   const handleHWSelect = useCallback(
     (hw: HWAccelInfo) => {
       setSelectedHWAccel(hw);
-      startTranscoding(selectedRenditions, hw);
+      // Check if user selected the hybrid option
+      const isHybrid = hw.displayName.startsWith('Hybrid');
+      startTranscoding(selectedRenditions, hw, isHybrid ? hybridConfig : null);
     },
-    [selectedRenditions]
+    [selectedRenditions, hybridConfig]
   );
 
   // Start transcoding
   const startTranscoding = useCallback(
-    async (renditionQualities: RenditionQuality[], hwAccel: HWAccelInfo) => {
+    async (
+      renditionQualities: RenditionQuality[],
+      hwAccel: HWAccelInfo,
+      hybrid: HybridHWAccel | null = null
+    ) => {
       if (!mediaInfo) return;
 
       setStep('transcoding');
@@ -264,6 +288,9 @@ export function App({ devMode }: AppProps) {
         await logger.info(`Skip existing: ${skipIfExists}`);
         await logger.info(`Renditions: ${renditions.map(r => r.quality).join(', ')}`);
         await logger.info(`HW Accel: ${hwAccel.displayName}`);
+        if (hybrid) {
+          await logger.info(`Hybrid Mode: HEVC=${hybrid.hevc.displayName}, VP9=${hybrid.vp9.displayName}`);
+        }
 
         // Calculate total jobs (VP9 + HEVC for each rendition)
         const jobs = renditions.length * 2;
@@ -295,6 +322,10 @@ export function App({ devMode }: AppProps) {
           codec: 'vp9' | 'hevc';
         }> = [];
 
+        // Determine which HW to use for each codec (hybrid mode uses different HW per codec)
+        const vp9HWAccel = hybrid ? hybrid.vp9 : hwAccel;
+        const hevcHWAccel = hybrid ? hybrid.hevc : hwAccel;
+
         for (const rendition of renditions) {
           // VP9 (output to tmp folder)
           setCurrentJob({ codec: 'vp9', quality: rendition.quality });
@@ -304,7 +335,7 @@ export function App({ devMode }: AppProps) {
               tmpDir,
               rendition,
               'vp9',
-              hwAccel,
+              vp9HWAccel,
               mediaInfo,
               settings,
               {
@@ -339,7 +370,7 @@ export function App({ devMode }: AppProps) {
               tmpDir,
               rendition,
               'hevc',
-              hwAccel,
+              hevcHWAccel,
               mediaInfo,
               settings,
               {

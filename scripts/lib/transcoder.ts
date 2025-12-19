@@ -53,14 +53,19 @@ const TONEMAP_FILTER_SOFTWARE =
 function buildScaleFilter(
   rendition: Rendition,
   hwAccel: HWAccelInfo,
-  needsTonemap: boolean
+  needsTonemap: boolean,
+  codec: 'vp9' | 'hevc' = 'hevc'
 ): string {
   const { width, height } = rendition;
 
   if (needsTonemap) {
-    // NVIDIA: Use CUDA upload + OpenCL tonemap + CUDA scale (all GPU)
-    if (hwAccel.method === 'nvidia') {
+    // NVIDIA: Use CUDA upload + OpenCL tonemap + CUDA scale (all GPU) - only for HEVC
+    if (hwAccel.method === 'nvidia' && codec === 'hevc') {
       return `format=p010,hwupload_cuda,tonemap_opencl=tonemap=hable:desat=0:format=nv12,hwdownload,format=nv12,hwupload_cuda,scale_cuda=w=${width}:h=${height}`;
+    }
+    // QSV VP9: Software tonemap then QSV scale (QSV VP9 is 8-bit only)
+    if (hwAccel.method === 'qsv' && codec === 'vp9' && hwAccel.supportsVP9HW) {
+      return `${TONEMAP_FILTER_SOFTWARE},hwupload=extra_hw_frames=64,scale_qsv=w=${width}:h=${height}`;
     }
     // Other HW: Software tonemap then scale (slow fallback)
     return `${TONEMAP_FILTER_SOFTWARE},scale=${width}:${height}`;
@@ -86,13 +91,60 @@ function buildVP9Args(
   rendition: Rendition,
   settings: TranscodeSettings,
   pass: 1 | 2,
-  passLogFile: string
+  passLogFile: string,
+  hwAccel: HWAccelInfo
 ): string[] {
+  const bitrate = rendition.vp9Bitrate;
+  const maxrate = rendition.maxrate;
+  const bufsize = rendition.bufsize;
+
+  // Intel QSV VP9 hardware encoding (8-bit only)
+  if (hwAccel.method === 'qsv' && hwAccel.supportsVP9HW) {
+    return [
+      '-c:v',
+      'vp9_qsv',
+      '-b:v',
+      `${bitrate}k`,
+      '-maxrate',
+      `${maxrate}k`,
+      '-bufsize',
+      `${bufsize}k`,
+      '-g',
+      '120',
+      '-keyint_min',
+      '120',
+      // QSV VP9 doesn't support two-pass, use single-pass with look-ahead
+      '-look_ahead',
+      '1',
+      '-look_ahead_depth',
+      settings.mode === 'prod' ? '40' : '10',
+    ];
+  }
+
+  // VAAPI VP9 hardware encoding (Linux)
+  if (hwAccel.method === 'vaapi' && hwAccel.supportsVP9HW) {
+    return [
+      '-c:v',
+      'vp9_vaapi',
+      '-b:v',
+      `${bitrate}k`,
+      '-maxrate',
+      `${maxrate}k`,
+      '-bufsize',
+      `${bufsize}k`,
+      '-g',
+      '120',
+      '-keyint_min',
+      '120',
+    ];
+  }
+
+  // Software VP9 (libvpx-vp9) - default fallback
   const args = [
     '-c:v',
     'libvpx-vp9',
     '-b:v',
-    `${rendition.vp9Bitrate}k`,
+    `${bitrate}k`,
     '-g',
     '120',
     '-keyint_min',
@@ -113,20 +165,10 @@ function buildVP9Args(
     args.push('-pass', pass.toString(), '-passlogfile', passLogFile);
 
     if (pass === 2) {
-      args.push(
-        '-maxrate',
-        `${rendition.maxrate}k`,
-        '-bufsize',
-        `${rendition.bufsize}k`
-      );
+      args.push('-maxrate', `${maxrate}k`, '-bufsize', `${bufsize}k`);
     }
   } else {
-    args.push(
-      '-maxrate',
-      `${rendition.maxrate}k`,
-      '-bufsize',
-      `${rendition.bufsize}k`
-    );
+    args.push('-maxrate', `${maxrate}k`, '-bufsize', `${bufsize}k`);
   }
 
   return args;
@@ -332,10 +374,22 @@ export async function transcodeRendition(
   const totalFrames = Math.ceil(
     mediaInfo.duration * mediaInfo.video.frameRate
   );
-  const needsTonemap =
-    !rendition.preserveHDR && mediaInfo.video.hdrType !== 'SDR';
 
-  const scaleFilter = buildScaleFilter(rendition, hwAccel, needsTonemap);
+  // Determine if we need to tonemap HDR to SDR
+  // For VP9 with QSV/VAAPI: always tonemap because VP9 HW encoding is 8-bit only
+  // For others: tonemap based on rendition preserveHDR setting
+  let needsTonemap = !rendition.preserveHDR && mediaInfo.video.hdrType !== 'SDR';
+  if (
+    codec === 'vp9' &&
+    (hwAccel.method === 'qsv' || hwAccel.method === 'vaapi') &&
+    hwAccel.supportsVP9HW &&
+    mediaInfo.video.hdrType !== 'SDR'
+  ) {
+    // Intel/VAAPI VP9 is 8-bit only, always tonemap HDR content
+    needsTonemap = true;
+  }
+
+  const scaleFilter = buildScaleFilter(rendition, hwAccel, needsTonemap, codec);
 
   await logger.info(`Total frames: ${totalFrames}`);
   await logger.info(`Needs tonemap: ${needsTonemap}`);
@@ -347,11 +401,18 @@ export async function transcodeRendition(
 
     // Input args (HW accel)
     // NVIDIA: Always use HW accel (tonemapping uses CUDA/OpenCL pipeline)
+    // QSV/VAAPI: Use HW accel for VP9 when hardware VP9 encoding is supported
     // Other HW: Only use when not tonemapping (software tonemap is incompatible)
     if (codec === 'hevc') {
       if (hwAccel.method === 'nvidia') {
         args.push(...buildHWAccelInputArgs(hwAccel));
       } else if (!needsTonemap) {
+        args.push(...buildHWAccelInputArgs(hwAccel));
+      }
+    } else if (codec === 'vp9') {
+      // For VP9 with QSV/VAAPI hardware encoding, use HW accel for decoding
+      // Note: VP9 HW encoding on Intel is 8-bit only, so we always tonemap HDR to SDR
+      if ((hwAccel.method === 'qsv' || hwAccel.method === 'vaapi') && hwAccel.supportsVP9HW) {
         args.push(...buildHWAccelInputArgs(hwAccel));
       }
     }
@@ -363,7 +424,7 @@ export async function transcodeRendition(
 
     // Codec-specific args
     if (codec === 'vp9') {
-      args.push(...buildVP9Args(rendition, settings, pass, passLogFile));
+      args.push(...buildVP9Args(rendition, settings, pass, passLogFile, hwAccel));
     } else {
       args.push(...buildHEVCArgs(rendition, settings, hwAccel));
     }
