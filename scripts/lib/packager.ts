@@ -17,16 +17,18 @@ export interface PackagerCallbacks {
 
 function buildVideoStreamArg(input: PackagerInput): string {
   const { filePath, quality, codec } = input;
-  const baseFileName = `${quality}_${codec}`;
-  // Input is in tmp/ subfolder, output goes to video/ subfolder
+  const baseFileName = `video_${quality}_${codec}`;
+  // Input is in tmp/ subfolder
   const inputFile = `tmp/${path.basename(filePath)}`;
+  // Output goes to videos/<baseFileName>/ subfolder for init and segments
+  // Playlist goes to videos/ folder
 
   return [
     `in=${inputFile}`,
     'stream=video',
-    `init_segment=video/${baseFileName}_init.mp4`,
-    `segment_template=video/${baseFileName}_$Number$.m4s`,
-    `playlist_name=video/${baseFileName}.m3u8`,
+    `init_segment=videos/${baseFileName}/${baseFileName}_init.mp4`,
+    `segment_template=videos/${baseFileName}/${baseFileName}_$Number$.m4s`,
+    `playlist_name=videos/${baseFileName}.m3u8`,
   ].join(',');
 }
 
@@ -36,14 +38,16 @@ function buildAudioStreamArg(input: PackagerInput): string {
   const safeLabel = label || safeLang.toUpperCase();
   // Include index in filename to ensure uniqueness for multiple audio tracks with same language
   const baseFileName = index !== undefined ? `audio_${safeLang}_${index}` : `audio_${safeLang}`;
-  // Input is in tmp/ subfolder, output goes to audio/ subfolder
+  // Input is in tmp/ subfolder
   const inputFile = `tmp/${path.basename(filePath)}`;
+  // Output goes to audio/<baseFileName>/ subfolder for init and segments
+  // Playlist goes to audio/ folder
 
   return [
     `in=${inputFile}`,
     'stream=audio',
-    `init_segment=audio/${baseFileName}_init.mp4`,
-    `segment_template=audio/${baseFileName}_$Number$.m4s`,
+    `init_segment=audio/${baseFileName}/${baseFileName}_init.mp4`,
+    `segment_template=audio/${baseFileName}/${baseFileName}_$Number$.m4s`,
     `playlist_name=audio/${baseFileName}.m3u8`,
     'hls_group_id=audio',
     `hls_name=${safeLabel}`,
@@ -51,25 +55,28 @@ function buildAudioStreamArg(input: PackagerInput): string {
   ].join(',');
 }
 
-function buildSubtitleStreamArg(input: PackagerInput): string {
+function buildSubtitleStreamArg(input: PackagerInput, index: number): string {
   const { filePath, language, label, subtitleType, isDefault } = input;
   const safeLang = language || 'und';
   const type = subtitleType || 'standard';
-  // Input is in tmp/ subfolder, output goes to subtitles/ subfolder
+  // Input is in tmp/ subfolder
   const inputFile = `tmp/${path.basename(filePath)}`;
 
   let suffix = '';
   if (type === 'forced') suffix = '_forced';
   else if (type === 'sdh') suffix = '_sdh';
 
-  const baseFileName = `sub_${safeLang}${suffix}`;
+  // Include index for uniqueness
+  const baseFileName = `subtitle_${safeLang}_${index}${suffix}`;
+  // Output goes to subtitles/<baseFileName>/ subfolder for init and segments
+  // Playlist goes to subtitles/ folder
 
   const parts = [
     `in=${inputFile}`,
     'stream=text',
     'format=vtt+mp4',
-    `init_segment=subtitles/${baseFileName}_init.mp4`,
-    `segment_template=subtitles/${baseFileName}_$Number$.m4s`,
+    `init_segment=subtitles/${baseFileName}/${baseFileName}_init.mp4`,
+    `segment_template=subtitles/${baseFileName}/${baseFileName}_$Number$.m4s`,
     `playlist_name=subtitles/${baseFileName}.m3u8`,
     'hls_group_id=subtitles',
     `hls_name=${label || safeLang.toUpperCase()}`,
@@ -95,14 +102,14 @@ function buildSubtitleStreamArg(input: PackagerInput): string {
   return parts.join(',');
 }
 
-function buildStreamArg(input: PackagerInput): string {
+function buildStreamArg(input: PackagerInput, subtitleIndex?: number): string {
   switch (input.type) {
     case 'video':
       return buildVideoStreamArg(input);
     case 'audio':
       return buildAudioStreamArg(input);
     case 'subtitle':
-      return buildSubtitleStreamArg(input);
+      return buildSubtitleStreamArg(input, subtitleIndex ?? 0);
     default:
       throw new Error(`Unknown input type: ${input.type}`);
   }
@@ -111,7 +118,8 @@ function buildStreamArg(input: PackagerInput): string {
 export async function runPackager(
   inputs: PackagerInput[],
   outputDir: string,
-  callbacks: PackagerCallbacks
+  callbacks: PackagerCallbacks,
+  devMode: boolean = false
 ): Promise<PackagerOutput> {
   const logger = getLogger();
   callbacks.onStart();
@@ -119,9 +127,37 @@ export async function runPackager(
   await logger.section('Packaging with Shaka Packager');
 
   // Create output subdirectories for organized output
-  await fs.mkdir(path.join(outputDir, 'video'), { recursive: true });
+  // Main folders for manifest files
+  await fs.mkdir(path.join(outputDir, 'videos'), { recursive: true });
   await fs.mkdir(path.join(outputDir, 'audio'), { recursive: true });
   await fs.mkdir(path.join(outputDir, 'subtitles'), { recursive: true });
+
+  // Create subfolders for each stream's init and segment files
+  for (const input of inputs) {
+    if (input.type === 'video') {
+      const baseFileName = `video_${input.quality}_${input.codec}`;
+      await fs.mkdir(path.join(outputDir, 'videos', baseFileName), { recursive: true });
+    } else if (input.type === 'audio') {
+      const safeLang = input.language || 'und';
+      const baseFileName = input.index !== undefined ? `audio_${safeLang}_${input.index}` : `audio_${safeLang}`;
+      await fs.mkdir(path.join(outputDir, 'audio', baseFileName), { recursive: true });
+    }
+  }
+
+  // Create subtitle subfolders (need to track index)
+  let subtitleIndex = 0;
+  for (const input of inputs) {
+    if (input.type === 'subtitle') {
+      const safeLang = input.language || 'und';
+      const type = input.subtitleType || 'standard';
+      let suffix = '';
+      if (type === 'forced') suffix = '_forced';
+      else if (type === 'sdh') suffix = '_sdh';
+      const baseFileName = `subtitle_${safeLang}_${subtitleIndex}${suffix}`;
+      await fs.mkdir(path.join(outputDir, 'subtitles', baseFileName), { recursive: true });
+      subtitleIndex++;
+    }
+  }
 
   const hlsPlaylist = path.join(outputDir, 'master.m3u8');
   const dashManifest = path.join(outputDir, 'manifest.mpd');
@@ -129,9 +165,12 @@ export async function runPackager(
   // Build packager arguments
   const args: string[] = [];
 
-  // Add stream arguments
+  // Add stream arguments (track subtitle index separately)
+  let subtitleIdx = 0;
   for (const input of inputs) {
-    const streamArg = buildStreamArg(input);
+    const streamArg = input.type === 'subtitle'
+      ? buildStreamArg(input, subtitleIdx++)
+      : buildStreamArg(input);
     args.push(streamArg);
     await logger.info(`Stream: ${input.type} - ${input.filePath}`);
   }
@@ -188,6 +227,19 @@ export async function runPackager(
     await logger.info(`Packaging complete`);
     await logger.info(`HLS Playlist: ${hlsPlaylist}`);
     await logger.info(`DASH Manifest: ${dashManifest}`);
+
+    // Clean up tmp folder in prod mode
+    if (!devMode) {
+      const tmpDir = path.join(outputDir, 'tmp');
+      try {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+        await logger.info(`Cleaned up tmp folder: ${tmpDir}`);
+      } catch (cleanupError) {
+        await logger.warn(`Failed to clean up tmp folder: ${cleanupError}`);
+      }
+    } else {
+      await logger.info(`Dev mode: keeping tmp folder for debugging`);
+    }
 
     const output: PackagerOutput = {
       hlsMasterPlaylist: hlsPlaylist,

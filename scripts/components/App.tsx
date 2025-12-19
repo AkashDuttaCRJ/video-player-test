@@ -445,7 +445,7 @@ export function App({ devMode }: AppProps) {
             setError(`Packaging failed: ${err}`);
             setStep('error');
           },
-        });
+        }, devMode);
 
         await logger.close();
         setPackagerOutput(output);
