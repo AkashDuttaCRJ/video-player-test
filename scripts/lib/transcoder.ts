@@ -50,48 +50,53 @@ export function getTranscodeSettings(mode: TranscodeMode): TranscodeSettings {
 const TONEMAP_FILTER_SOFTWARE =
   'zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p';
 
+/**
+ * Build scale filter using height-based scaling to preserve aspect ratio.
+ * Uses -2 for width to ensure it's divisible by 2 (required by most encoders).
+ */
 function buildScaleFilter(
   rendition: Rendition,
   hwAccel: HWAccelInfo,
   needsTonemap: boolean,
-  codec: 'vp9' | 'hevc' = 'hevc',
-  useHwAccelInput: boolean = false
+  codec: 'vp9' | 'hevc' = 'hevc'
 ): string {
-  const { width, height } = rendition;
+  const { height } = rendition;
 
   if (needsTonemap) {
-    // NVIDIA HEVC with HW accel input: Need to hwdownload first since input is in CUDA format
-    if (hwAccel.method === 'nvidia' && codec === 'hevc' && useHwAccelInput) {
-      // Input is CUDA, download to CPU, tonemap, upload back, scale
-      return `hwdownload,format=p010,tonemap_opencl=tonemap=hable:desat=0:format=nv12,hwdownload,format=nv12,hwupload_cuda,scale_cuda=w=${width}:h=${height}`;
-    }
-    // NVIDIA HEVC without HW accel input (software decode)
+    // All tonemapping uses software pipeline for maximum compatibility
+    // OpenCL/CUDA tonemap often fails due to driver issues on Windows
+
+    // NVIDIA HEVC: Software tonemap + scale, then hwupload for NVENC encoding
     if (hwAccel.method === 'nvidia' && codec === 'hevc') {
-      return `format=p010,hwupload_cuda,tonemap_opencl=tonemap=hable:desat=0:format=nv12,hwdownload,format=nv12,hwupload_cuda,scale_cuda=w=${width}:h=${height}`;
+      return `${TONEMAP_FILTER_SOFTWARE},scale=-2:${height},hwupload_cuda`;
     }
-    // QSV/VAAPI VP9: Software tonemap then software scale (no hwupload needed, encoder handles it)
-    // Note: We don't use HW accel input for VP9 when tonemapping
-    if ((hwAccel.method === 'qsv' || hwAccel.method === 'vaapi') && codec === 'vp9' && hwAccel.supportsVP9HW) {
-      return `${TONEMAP_FILTER_SOFTWARE},scale=${width}:${height}`;
+    // QSV VP9: Software tonemap + scale, output nv12 for QSV encoder
+    if (hwAccel.method === 'qsv' && codec === 'vp9' && hwAccel.supportsVP9HW) {
+      return `${TONEMAP_FILTER_SOFTWARE},scale=-2:${height},format=nv12`;
     }
-    // Other HW: Software tonemap then scale (slow fallback)
-    return `${TONEMAP_FILTER_SOFTWARE},scale=${width}:${height}`;
+    // VAAPI VP9: Software tonemap + scale
+    if (hwAccel.method === 'vaapi' && codec === 'vp9' && hwAccel.supportsVP9HW) {
+      return `${TONEMAP_FILTER_SOFTWARE},scale=-2:${height}`;
+    }
+    // Other HW or software: Software tonemap + scale
+    return `${TONEMAP_FILTER_SOFTWARE},scale=-2:${height}`;
   }
 
+  // No tonemapping needed - use HW scaling where available
   if (hwAccel.method === 'nvidia') {
-    return `scale_cuda=w=${width}:h=${height}`;
+    return `scale_cuda=w=-2:h=${height}`;
   }
 
   if (hwAccel.method === 'qsv') {
-    return `scale_qsv=w=${width}:h=${height}`;
+    return `scale_qsv=w=-2:h=${height}`;
   }
 
   if (hwAccel.method === 'vaapi') {
-    return `scale_vaapi=w=${width}:h=${height}`;
+    return `scale_vaapi=w=-2:h=${height}`;
   }
 
-  // Software or other
-  return `scale=${width}:${height}`;
+  // Software or other - use -2 for width to preserve aspect ratio
+  return `scale=-2:${height}`;
 }
 
 function buildVP9Args(
@@ -106,6 +111,7 @@ function buildVP9Args(
   const bufsize = rendition.bufsize;
 
   // Intel QSV VP9 hardware encoding (8-bit only)
+  // Note: vp9_qsv has limited options - no look_ahead, no two-pass
   if (hwAccel.method === 'qsv' && hwAccel.supportsVP9HW) {
     return [
       '-c:v',
@@ -118,13 +124,9 @@ function buildVP9Args(
       `${bufsize}k`,
       '-g',
       '120',
-      '-keyint_min',
-      '120',
-      // QSV VP9 doesn't support two-pass, use single-pass with look-ahead
-      '-look_ahead',
+      // Use low_power mode for better compatibility
+      '-low_power',
       '1',
-      '-look_ahead_depth',
-      settings.mode === 'prod' ? '40' : '10',
     ];
   }
 
@@ -413,7 +415,7 @@ export async function transcodeRendition(
     useHwAccelInput = false;
   }
 
-  const scaleFilter = buildScaleFilter(rendition, hwAccel, needsTonemap, codec, useHwAccelInput);
+  const scaleFilter = buildScaleFilter(rendition, hwAccel, needsTonemap, codec);
 
   await logger.info(`Total frames: ${totalFrames}`);
   await logger.info(`Needs tonemap: ${needsTonemap}`);

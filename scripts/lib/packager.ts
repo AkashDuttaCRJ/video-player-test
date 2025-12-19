@@ -159,8 +159,12 @@ export async function runPackager(
     }
   }
 
-  const hlsPlaylist = path.join(outputDir, 'master.m3u8');
-  const dashManifest = path.join(outputDir, 'manifest.mpd');
+  // Use relative paths for packager output since cwd is outputDir
+  const hlsPlaylistRelative = 'master.m3u8';
+  const dashManifestRelative = 'manifest.mpd';
+  // Absolute paths for return value
+  const hlsPlaylist = path.join(outputDir, hlsPlaylistRelative);
+  const dashManifest = path.join(outputDir, dashManifestRelative);
 
   // Build packager arguments
   const args: string[] = [];
@@ -175,16 +179,16 @@ export async function runPackager(
     await logger.info(`Stream: ${input.type} - ${input.filePath}`);
   }
 
-  // Add output options
+  // Add output options (use relative paths since cwd is outputDir)
   args.push(
     '--segment_duration',
     '5',
     '--fragment_duration',
     '5',
     '--mpd_output',
-    dashManifest,
+    dashManifestRelative,
     '--hls_master_playlist_output',
-    hlsPlaylist,
+    hlsPlaylistRelative,
     '--generate_static_live_mpd'
   );
 
