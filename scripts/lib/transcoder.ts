@@ -54,18 +54,25 @@ function buildScaleFilter(
   rendition: Rendition,
   hwAccel: HWAccelInfo,
   needsTonemap: boolean,
-  codec: 'vp9' | 'hevc' = 'hevc'
+  codec: 'vp9' | 'hevc' = 'hevc',
+  useHwAccelInput: boolean = false
 ): string {
   const { width, height } = rendition;
 
   if (needsTonemap) {
-    // NVIDIA: Use CUDA upload + OpenCL tonemap + CUDA scale (all GPU) - only for HEVC
+    // NVIDIA HEVC with HW accel input: Need to hwdownload first since input is in CUDA format
+    if (hwAccel.method === 'nvidia' && codec === 'hevc' && useHwAccelInput) {
+      // Input is CUDA, download to CPU, tonemap, upload back, scale
+      return `hwdownload,format=p010,tonemap_opencl=tonemap=hable:desat=0:format=nv12,hwdownload,format=nv12,hwupload_cuda,scale_cuda=w=${width}:h=${height}`;
+    }
+    // NVIDIA HEVC without HW accel input (software decode)
     if (hwAccel.method === 'nvidia' && codec === 'hevc') {
       return `format=p010,hwupload_cuda,tonemap_opencl=tonemap=hable:desat=0:format=nv12,hwdownload,format=nv12,hwupload_cuda,scale_cuda=w=${width}:h=${height}`;
     }
-    // QSV VP9: Software tonemap then QSV scale (QSV VP9 is 8-bit only)
-    if (hwAccel.method === 'qsv' && codec === 'vp9' && hwAccel.supportsVP9HW) {
-      return `${TONEMAP_FILTER_SOFTWARE},hwupload=extra_hw_frames=64,scale_qsv=w=${width}:h=${height}`;
+    // QSV/VAAPI VP9: Software tonemap then software scale (no hwupload needed, encoder handles it)
+    // Note: We don't use HW accel input for VP9 when tonemapping
+    if ((hwAccel.method === 'qsv' || hwAccel.method === 'vaapi') && codec === 'vp9' && hwAccel.supportsVP9HW) {
+      return `${TONEMAP_FILTER_SOFTWARE},scale=${width}:${height}`;
     }
     // Other HW: Software tonemap then scale (slow fallback)
     return `${TONEMAP_FILTER_SOFTWARE},scale=${width}:${height}`;
@@ -389,7 +396,24 @@ export async function transcodeRendition(
     needsTonemap = true;
   }
 
-  const scaleFilter = buildScaleFilter(rendition, hwAccel, needsTonemap, codec);
+  // Determine if we should use HW accel for input decoding
+  // Don't use HW accel input when tonemapping (software tonemap needs CPU frames)
+  // Exception: NVIDIA HEVC can do GPU tonemap pipeline
+  let useHwAccelInput = false;
+  if (codec === 'hevc' && hwAccel.method === 'nvidia') {
+    // NVIDIA can handle tonemap on GPU, but the pipeline is complex
+    // For now, don't use HW accel input when tonemapping to simplify the filter chain
+    useHwAccelInput = !needsTonemap;
+  } else if (codec === 'hevc' && !needsTonemap) {
+    // Other HW: Only use HW accel when not tonemapping
+    useHwAccelInput = true;
+  } else if (codec === 'vp9') {
+    // VP9: Don't use HW accel input (software decode + software tonemap + software scale)
+    // The encoder will handle the HW encoding from CPU frames
+    useHwAccelInput = false;
+  }
+
+  const scaleFilter = buildScaleFilter(rendition, hwAccel, needsTonemap, codec, useHwAccelInput);
 
   await logger.info(`Total frames: ${totalFrames}`);
   await logger.info(`Needs tonemap: ${needsTonemap}`);
@@ -400,21 +424,10 @@ export async function transcodeRendition(
     const args: string[] = ['-y'];
 
     // Input args (HW accel)
-    // NVIDIA: Always use HW accel (tonemapping uses CUDA/OpenCL pipeline)
-    // QSV/VAAPI: Use HW accel for VP9 when hardware VP9 encoding is supported
-    // Other HW: Only use when not tonemapping (software tonemap is incompatible)
-    if (codec === 'hevc') {
-      if (hwAccel.method === 'nvidia') {
-        args.push(...buildHWAccelInputArgs(hwAccel));
-      } else if (!needsTonemap) {
-        args.push(...buildHWAccelInputArgs(hwAccel));
-      }
-    } else if (codec === 'vp9') {
-      // For VP9 with QSV/VAAPI hardware encoding, use HW accel for decoding
-      // Note: VP9 HW encoding on Intel is 8-bit only, so we always tonemap HDR to SDR
-      if ((hwAccel.method === 'qsv' || hwAccel.method === 'vaapi') && hwAccel.supportsVP9HW) {
-        args.push(...buildHWAccelInputArgs(hwAccel));
-      }
+    // Only use HW accel input when useHwAccelInput is true
+    // This is determined above based on codec, HW method, and tonemap requirements
+    if (useHwAccelInput) {
+      args.push(...buildHWAccelInputArgs(hwAccel));
     }
 
     args.push('-i', inputPath);
